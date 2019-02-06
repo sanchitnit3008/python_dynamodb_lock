@@ -54,7 +54,7 @@ class DynamoDBLockClient:
                  dynamodb_resource,
                  table_name=_DEFAULT_TABLE_NAME,
                  partition_key_name=_DEFAULT_PARTITION_KEY_NAME,
-                 sort_key_name=_DEFAULT_SORT_KEY_NAME,
+                 sort_key_name=None,
                  ttl_attribute_name=_DEFAULT_TTL_ATTRIBUTE_NAME,
                  owner_name=None,
                  heartbeat_period=_DEFAULT_HEARTBEAT_PERIOD,
@@ -96,9 +96,9 @@ class DynamoDBLockClient:
         self._dynamodb_resource = dynamodb_resource
         self._table_name = table_name
         self._partition_key_name = partition_key_name
-        self._sort_key_name = sort_key_name
+        self._sort_key_name = sort_key_name or None
         self._ttl_attribute_name = ttl_attribute_name
-        self._owner_name = owner_name or (socket.getfqdn() + self._uuid)
+        self._owner_name = owner_name or None
         self._heartbeat_period = heartbeat_period
         self._safe_period = safe_period
         self._lease_duration = lease_duration
@@ -206,19 +206,24 @@ class DynamoDBLockClient:
                 new_expiry_time = int(time.time() + self._expiry_period.total_seconds())
 
                 # first, try to update the database
+                key_dict = {
+                    self._partition_key_name: lock.partition_key
+                }
+                condition_expression_string = 'attribute_exists(#pk) AND #rvn = :old_rvn'
+                expression_attribute_names = {
+                    '#pk': self._partition_key_name,
+                    '#rvn': self._COL_RECORD_VERSION_NUMBER,
+                    '#et': self._ttl_attribute_name,
+                }
+                if self._sort_key_name and lock.sort_key:
+                    key_dict[self._sort_key_name] = lock.sort_key
+                    condition_expression_string = condition_expression_string + ' AND attribute_exists(#sk)'
+                    expression_attribute_names['#sk'] = self._sort_key_name
                 self._dynamodb_table.update_item(
-                    Key={
-                        self._partition_key_name: lock.partition_key,
-                        self._sort_key_name: lock.sort_key
-                    },
+                    Key=key_dict,
                     UpdateExpression='SET #rvn = :new_rvn, #et = :new_et',
-                    ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
-                    ExpressionAttributeNames={
-                        '#pk': self._partition_key_name,
-                        '#sk': self._sort_key_name,
-                        '#rvn': self._COL_RECORD_VERSION_NUMBER,
-                        '#et': self._ttl_attribute_name,
-                    },
+                    ConditionExpression=condition_expression_string,
+                    ExpressionAttributeNames=expression_attribute_names,
                     ExpressionAttributeValues={
                         ':old_rvn': old_record_version_number,
                         ':new_rvn': new_record_version_number,
@@ -343,7 +348,7 @@ class DynamoDBLockClient:
 
     def acquire_lock(self,
                      partition_key,
-                     sort_key=_DEFAULT_SORT_KEY_VALUE,
+                     sort_key,
                      retry_period=None,
                      retry_timeout=None,
                      additional_attributes=None,
@@ -388,6 +393,8 @@ class DynamoDBLockClient:
         :rtype: DynamoDBLock
         :return: A distributed lock instance
         """
+        if self._sort_key_name and not sort_key:
+            sort_key = self._DEFAULT_SORT_KEY_VALUE
         logger.info('Trying to acquire lock for: %s, %s', partition_key, sort_key)
 
         # plug in default values as needed
@@ -397,8 +404,8 @@ class DynamoDBLockClient:
         # create the "new" lock that needs to be acquired
         new_lock = DynamoDBLock(
             partition_key=partition_key,
-            sort_key=sort_key,
-            owner_name=self._owner_name,
+            sort_key=sort_key or None,
+            owner_name=self._owner_name or None,
             lease_duration=self._lease_duration.total_seconds(),
             record_version_number=str( uuid.uuid4() ),
             expiry_time=int(time.time() + self._expiry_period.total_seconds()),
@@ -520,17 +527,22 @@ class DynamoDBLockClient:
                 del self._locks[lock.unique_identifier]
 
                 # then, remove it from the database
+                key_dict = {
+                    self._partition_key_name: lock.partition_key,
+                }
+                condition_expression_string = 'attribute_exists(#pk) AND #rvn = :rvn'
+                expression_attribute_names = {
+                    '#pk': self._partition_key_name,
+                    '#rvn': self._COL_RECORD_VERSION_NUMBER
+                }
+                if self._sort_key_name and lock.sort_key:
+                    key_dict[self._sort_key_name] = lock.sort_key
+                    condition_expression_string = condition_expression_string + ' AND attribute_exists(#sk)'
+                    expression_attribute_names['#sk'] = self._sort_key_name
                 self._dynamodb_table.delete_item(
-                    Key={
-                        self._partition_key_name: lock.partition_key,
-                        self._sort_key_name: lock.sort_key
-                    },
-                    ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :rvn',
-                    ExpressionAttributeNames={
-                        '#pk': self._partition_key_name,
-                        '#sk': self._sort_key_name,
-                        '#rvn': self._COL_RECORD_VERSION_NUMBER,
-                    },
+                    Key=key_dict,
+                    ConditionExpression=condition_expression_string,
+                    ExpressionAttributeNames=expression_attribute_names,
                     ExpressionAttributeValues={
                         ':rvn': lock.record_version_number,
                     }
@@ -561,11 +573,13 @@ class DynamoDBLockClient:
         :rtype: BaseDynamoDBLock
         """
         logger.debug('Getting the lock from dynamodb for: %s, %s', partition_key, sort_key)
+        key_dict = {
+            self._partition_key_name: partition_key,
+        }
+        if self._sort_key_name and sort_key:
+            key_dict[self._sort_key_name] = sort_key
         result = self._dynamodb_table.get_item(
-            Key={
-                self._partition_key_name: partition_key,
-                self._sort_key_name: sort_key
-            },
+            Key=key_dict,
             ConsistentRead=True
         )
         if 'Item' in result:
@@ -581,13 +595,19 @@ class DynamoDBLockClient:
         :param DynamoDBLock lock: The lock instance that needs to be added to the database.
         """
         logger.debug('Adding a new lock: %s', str(lock))
+        condition_expression_string = 'NOT(attribute_exists(#pk)'
+        expression_attribute_names = {
+            '#pk': self._partition_key_name,
+        }
+        if self._sort_key_name and lock.sort_key:
+            condition_expression_string = condition_expression_string + ' AND attribute_exists(#sk))'
+            expression_attribute_names['#sk'] = self._sort_key_name
+        else:
+            condition_expression_string = condition_expression_string + ')'
         self._dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
-            ConditionExpression='NOT(attribute_exists(#pk) AND attribute_exists(#sk))',
-            ExpressionAttributeNames={
-                '#pk': self._partition_key_name,
-                '#sk': self._sort_key_name,
-            },
+            ConditionExpression=condition_expression_string,
+            ExpressionAttributeNames=expression_attribute_names,
         )
 
 
@@ -599,14 +619,18 @@ class DynamoDBLockClient:
         :param str record_version_number: The version-number for the old lock instance in the database.
         """
         logger.debug('Overwriting existing-rvn: %s with new lock: %s', record_version_number, str(lock))
+        condition_expression_string = 'attribute_exists(#pk) AND #rvn = :old_rvn'
+        expression_attribute_names = {
+            '#pk': self._partition_key_name,
+            '#rvn': self._COL_RECORD_VERSION_NUMBER,
+        }
+        if self._sort_key_name and lock.sort_key:
+            condition_expression_string = condition_expression_string + ' AND attribute_exists(#sk)'
+            expression_attribute_names['#sk'] = self._sort_key_name
         self._dynamodb_table.put_item(
             Item=self._get_item_from_lock(lock),
-            ConditionExpression='attribute_exists(#pk) AND attribute_exists(#sk) AND #rvn = :old_rvn',
-            ExpressionAttributeNames={
-                '#pk': self._partition_key_name,
-                '#sk': self._sort_key_name,
-                '#rvn': self._COL_RECORD_VERSION_NUMBER,
-            },
+            ConditionExpression=condition_expression_string,
+            ExpressionAttributeNames=expression_attribute_names,
             ExpressionAttributeValues={
                 ':old_rvn': record_version_number,
             }
@@ -623,13 +647,15 @@ class DynamoDBLockClient:
         logger.debug('Get lock from item: %s', str(item))
         lock = BaseDynamoDBLock(
             partition_key=item.pop(self._partition_key_name),
-            sort_key=item.pop(self._sort_key_name),
-            owner_name=item.pop(self._COL_OWNER_NAME),
             lease_duration=float(item.pop(self._COL_LEASE_DURATION)),
             record_version_number=item.pop(self._COL_RECORD_VERSION_NUMBER),
             expiry_time=int(item.pop(self._ttl_attribute_name)),
             additional_attributes=item
         )
+        if self._sort_key_name and item.get(self._sort_key_name, None):
+            lock.sort_key = item.pop(self._sort_key_name)
+        if self._COL_OWNER_NAME and item.get(self._COL_OWNER_NAME, None):
+            lock.owner_name = item.pop(self._COL_OWNER_NAME)
         return lock
 
 
@@ -642,14 +668,17 @@ class DynamoDBLockClient:
         """
         logger.debug('Get item from lock: %s', str(lock))
         item = lock.additional_attributes.copy()
-        item.update({
-            self._partition_key_name: lock.partition_key,
-            self._sort_key_name: lock.sort_key,
-            self._COL_OWNER_NAME: lock.owner_name,
+        update_dict = {
+            self._partition_key_name : lock.partition_key,
             self._COL_LEASE_DURATION: Decimal.from_float(lock.lease_duration),
             self._COL_RECORD_VERSION_NUMBER: lock.record_version_number,
             self._ttl_attribute_name: lock.expiry_time
-        })
+        }
+        if self._sort_key_name and lock.sort_key:
+            update_dict[self._sort_key_name] = lock.sort_key
+        if self._COL_OWNER_NAME and lock.owner_name:
+            update_dict[self._COL_OWNER_NAME] = lock.owner_name
+        item.update(update_dict)
         return item
 
 
@@ -799,14 +828,14 @@ class BaseDynamoDBLock:
         :param dict additional_attributes: Arbitrary application metadata to be stored with the lock
         """
         self.partition_key = partition_key
-        self.sort_key = sort_key
-        self.owner_name = owner_name
+        self.sort_key = sort_key or None
+        self.owner_name = owner_name or None
         self.lease_duration = lease_duration
         self.record_version_number = record_version_number
         self.expiry_time = expiry_time
         self.additional_attributes = additional_attributes or {}
         # additional properties
-        self.unique_identifier = quote(partition_key) + '|' + quote(sort_key)
+        self.unique_identifier = quote(partition_key) + '|' + quote(sort_key or "")
 
 
     def __str__(self):
