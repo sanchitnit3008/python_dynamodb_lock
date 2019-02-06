@@ -348,7 +348,7 @@ class DynamoDBLockClient:
 
     def acquire_lock(self,
                      partition_key,
-                     sort_key,
+                     sort_key=None,
                      retry_period=None,
                      retry_timeout=None,
                      additional_attributes=None,
